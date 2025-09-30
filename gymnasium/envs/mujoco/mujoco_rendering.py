@@ -442,11 +442,15 @@ class WindowViewer(BaseRender):
                 self.model,
                 self.data,
                 self.vopt,
-                mujoco.MjvPerturb(),
+                self.pert,
                 self.cam,
                 mujoco.mjtCatBit.mjCAT_ALL.value,
                 self.scn,
             )
+
+            # apply any active perturbations (pose updates + forces)
+            mujoco.mjv_applyPerturbPose(self.model, self.data, self.pert, 0)
+            mujoco.mjv_applyPerturbForce(self.model, self.data, self.pert)
 
             # marker items
             for marker in self._markers:
@@ -594,6 +598,32 @@ class WindowViewer(BaseRender):
         dy = int(self._scale * ypos) - self._last_mouse_y
         width, height = glfw.get_framebuffer_size(window)
 
+        if self.pert.active:
+
+            if self.pert.active == mujoco.mjtPertBit.mjPERT_TRANSLATE:
+                action = (
+                    mujoco.mjtMouse.mjMOUSE_MOVE_H if mod_shift
+                    else mujoco.mjtMouse.mjMOUSE_MOVE_V
+                )
+            else:
+                action = mujoco.mjtMouse.mjMOUSE_ROTATE_H
+
+            mujoco.mjv_movePerturb(
+                self.model,
+                self.data,
+                action,
+                dx / height,
+                dy / height,
+                self.scn,
+                self.pert,
+            )
+
+            self._last_mouse_x = int(self._scale * xpos)
+            self._last_mouse_y = int(self._scale * ypos)
+
+            # Skip camera movement when perturbing
+            return
+
         mujoco.mjv_moveCamera(
             self.model, action, dx / width, dy / height, self.scn, self.cam
         )
@@ -612,6 +642,47 @@ class WindowViewer(BaseRender):
         x, y = glfw.get_cursor_pos(window)
         self._last_mouse_x = int(self._scale * x)
         self._last_mouse_y = int(self._scale * y)
+
+        # handle new Ctrl+click selection for perturbation
+        if act == glfw.PRESS and (mods & glfw.MOD_CONTROL):
+            width, height = glfw.get_framebuffer_size(window)
+            aspect = width / height
+            relx = self._last_mouse_x / width
+            rely = (height - self._last_mouse_y) / height
+
+            selpnt = np.zeros(3, dtype=np.float64)
+            geomid = np.zeros(1, dtype=np.int32)
+            flexid = np.zeros(1, dtype=np.int32)
+            skinid = np.zeros(1, dtype=np.int32)
+
+            selected = mujoco.mjv_select(
+                self.model, self.data, self.vopt,
+                aspect, relx, rely, 
+                self.scn,
+                selpnt, geomid, flexid, skinid,
+            )
+
+            if selected >= 0:
+                bodyid = selected
+                self.pert.select = bodyid
+                self.pert.skinselect = int(skinid[0])
+
+                # compute local offset between selection point and body COM
+                offset = selpnt - self.data.xpos[bodyid]
+                self.pert.localpos = self.data.xmat[bodyid].reshape(3, 3) @ offset
+                
+                # left click → rotation, right click → translation
+                self.pert.active = (
+                    mujoco.mjtPertBit.mjPERT_ROTATE
+                    if button == glfw.MOUSE_BUTTON_LEFT
+                    else mujoco.mjtPertBit.mjPERT_TRANSLATE
+                )
+                mujoco.mjv_initPerturb(self.model, self.data, self.scn, self.pert)
+
+        elif act == glfw.RELEASE:
+            # reset perturbation state when mouse button is released
+            self.pert.active = 0
+            self.data.xfrc_applied[self.pert.select] = 0
 
     def _scroll_callback(self, window, x_offset, y_offset: float):
         mujoco.mjv_moveCamera(
